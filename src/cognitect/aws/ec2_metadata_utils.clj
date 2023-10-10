@@ -33,7 +33,7 @@
 (defn build-path [& components]
   (str/replace (str/join \/ components) #"\/\/+" (constantly "/")))
 
-(defn- build-uri
+(defn build-uri
   [host path]
   (str host "/" (cond-> path (str/starts-with? path "/") (subs 1))))
 
@@ -44,26 +44,44 @@
       (when (in-container?) ecs-metadata-host)
       ec2-metadata-host))
 
-(defn- request-map
-  [^URI uri]
-  (let [auth-token (u/getenv container-authorization-token-env-var)]
-    {:scheme (.getScheme uri)
-     :server-name (.getHost uri)
-     :server-port (or (when (pos? (.getPort uri)) (.getPort uri))
-                      (when (#{"https"} (.getScheme uri)) 443)
-                      80)
-     :uri (.getPath uri)
-     :request-method :get
-     :headers (cond-> {"Accept" "*/*"}
-                auth-token
-                (assoc "Authorization" auth-token))}))
+(defn request-map
+  ([^URI uri]
+   (request-map uri nil))
+  ([^URI uri {:keys [headers request-method]}]
+   (let [auth-token (u/getenv container-authorization-token-env-var)]
+     {:scheme (.getScheme uri)
+      :server-name (.getHost uri)
+      :server-port (or (when (pos? (.getPort uri)) (.getPort uri))
+                       (when (#{"https"} (.getScheme uri)) 443)
+                       80)
+      :uri (.getPath uri)
+      :request-method (or request-method :get)
+      :headers (if headers
+                 headers
+                 (cond-> {"Accept" "*/*"}
+                   auth-token
+                   (assoc "Authorization" auth-token)))})))
+
+(defn http-submit [request http-client]
+  (a/<!! (retry/with-retry
+           #(http/submit http-client request)
+           (a/promise-chan)
+           retry/default-retriable?
+           retry/default-backoff)))
 
 (defn get-data [uri http-client]
-  (let [response (a/<!! (retry/with-retry
-                          #(http/submit http-client (request-map (URI. uri)))
-                          (a/promise-chan)
-                          retry/default-retriable?
-                          retry/default-backoff))]
+  (let [token (-> (request-map
+                    (URI. (build-uri (get-host-address) "/latest/api/token"))
+                    {:headers {"X-aws-ec2-metadata-token-ttl-seconds" "21600"}
+                     :request-method :put})
+                  (http-submit http-client)
+                  :body
+                  u/bbuf->str)
+        response (http-submit
+                   (request-map
+                     (URI. uri)
+                     {:headers {"X-aws-ec2-metadata-token" token}})
+                   http-client)]
     ;; TODO: handle unhappy paths -JS
     (when (= 200 (:status response))
       (u/bbuf->str (:body response)))))
